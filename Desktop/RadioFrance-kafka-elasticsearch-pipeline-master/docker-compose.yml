@@ -1,0 +1,193 @@
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "12181:2181"  # Changé de 2181 à 12181
+    networks:
+      - pipeline-network
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "19092:9092"  # Changé de 9092 à 19092
+      - "19093:9093"  # Changé de 9093 à 19093
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181  # À l'intérieur du réseau Docker, on garde 2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:19092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_MESSAGE_MAX_BYTES: 5242880
+    networks:
+      - pipeline-network
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.12.2
+    container_name: elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      - "19200:9200"  # Changé de 9200 à 19200
+      - "19300:9300"  # Changé de 9300 à 19300
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    networks:
+      - pipeline-network
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.12.2
+    container_name: kibana
+    depends_on:
+      - elasticsearch
+    ports:
+      - "15601:5601"  # Changé de 5601 à 15601
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+    networks:
+      - pipeline-network
+
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.12.2
+    container_name: logstash
+    depends_on:
+      - kafka
+      - elasticsearch
+    ports:
+      - "15044:5044"  # Changé de 5044 à 15044
+      - "19600:9600"  # Changé de 9600 à 19600
+    volumes:
+      - ./logstash/pipeline:/usr/share/logstash/pipeline
+    environment:
+      - "LS_JAVA_OPTS=-Xmx256m -Xms256m"
+    networks:
+      - pipeline-network
+
+
+  api-collector:
+    build:
+      context: ./api-collector
+      dockerfile: Dockerfile
+    container_name: radiofrance-collector
+    depends_on:
+      - kafka
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - RADIOFRANCE_API_TOKEN=${RADIOFRANCE_API_KEY}
+      - RADIOFRANCE_API_URL=https://openapi.radiofrance.fr/v1/graphql
+      - KAFKA_TOPIC=radiofrance-live
+      - POLL_INTERVAL=300
+    env_file:
+      - .env
+    networks:
+      - pipeline-network
+    restart: unless-stopped
+
+  elasticsearch-setup:
+    image: curlimages/curl:latest
+    container_name: elasticsearch-setup
+    volumes:
+      - ./elasticsearch/mappings/radiofrance-mapping.json:/mapping.json
+      - ./elasticsearch/mappings/radiofrance-analytics-mapping.json:/analytics-mapping.json
+    networks:
+      - pipeline-network
+    depends_on:
+      - elasticsearch
+    command: >
+      sh -c "
+        # Attendre qu'Elasticsearch soit prêt
+        until curl -s http://elasticsearch:9200; do sleep 5; done;
+        
+        # Appliquer le mapping pour les données brutes Radio France
+        echo '{\"index_patterns\": [\"radiofrance-live-*\"], \"template\":' > /tmp/payload.json;
+        cat /mapping.json >> /tmp/payload.json;
+        echo '}' >> /tmp/payload.json;
+        curl -XPUT http://elasticsearch:9200/_index_template/rf_template \
+          -H 'Content-Type: application/json' \
+          -d @/tmp/payload.json;
+        
+        # Appliquer le mapping pour les résultats analytiques Spark
+        echo '{\"index_patterns\": [\"radiofrance-analytics-*\"], \"template\":' > /tmp/analytics-payload.json;
+        cat /analytics-mapping.json >> /tmp/analytics-payload.json;
+        echo '}' >> /tmp/analytics-payload.json;
+        curl -XPUT http://elasticsearch:9200/_index_template/rf_analytics_template \
+          -H 'Content-Type: application/json' \
+          -d @/tmp/analytics-payload.json;
+        
+        echo '✅ Templates Elasticsearch configurés avec succès';
+      "
+
+  spark-master:
+    image: apache/spark:3.5.1
+    container_name: spark-master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    ports:
+      - "17077:7077"
+      - "18080:8080"
+    environment:
+      - SPARK_MASTER_HOST=spark-master
+      - SPARK_MASTER_PORT=7077
+      - SPARK_MASTER_WEBUI_PORT=8080
+    volumes:
+      - ./spark/jobs:/opt/spark/jobs
+    networks:
+      - pipeline-network
+
+  spark-worker:
+    image: apache/spark:3.5.1
+    container_name: spark-worker
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    depends_on:
+      - spark-master
+    environment:
+      - SPARK_WORKER_CORES=2
+      - SPARK_WORKER_MEMORY=2g
+      - SPARK_WORKER_WEBUI_PORT=8081
+    ports:
+      - "18081:8081"
+    volumes:
+      - ./spark/jobs:/opt/spark/jobs
+    networks:
+      - pipeline-network
+
+  spark-submit:
+    image: apache/spark:3.5.1
+    container_name: spark-submit
+    depends_on:
+      - spark-master
+      - elasticsearch
+    volumes:
+      - ./spark:/opt/spark
+    networks:
+      - pipeline-network
+    command: >
+      bash -c "
+        echo '⏳ Attente des services...' &&
+        sleep 120 &&
+        echo '🚀 Lancement du job Spark...' &&
+        /opt/spark/bin/spark-submit \
+          --master spark://spark-master:7077 \
+          --packages org.elasticsearch:elasticsearch-spark-30_2.12:8.12.0 \
+          --executor-memory 1g \
+          --driver-memory 1g \
+          /opt/spark/jobs/radiofrance_analytics_simple.py
+      "
+
+
+networks:
+  pipeline-network:
+    driver: bridge
+
+volumes:
+  elasticsearch-data:
+    driver: local
